@@ -553,101 +553,257 @@ function escBig(s) {
   return s;
 }
 
-/** Whether escaped line `l` opens on ">" (written "&gt;"; a raw "&gt;" reads "&amp;gt;", so this is never it). */
-const isQuote = (l) => l.length >= 4 && l.charCodeAt(0) === 38 && l.startsWith('&gt;');
+// The block lexer works on the escaped body `e` by positions: line k is e[LS[k], LE[k]). No line strings are made;
+// a block whose text needs no trimming goes to the inline renderer as a range of `e`.
 
-/** An escaped quote line without its ">" and one space after it. */
-const unquoteE = (l) => (l.charCodeAt(4) === 32 ? l.slice(5) : l.slice(4));
+let LS = new Int32Array(4096);
+let LE = new Int32Array(4096);
+
+/** Fill LS/LE with the lines of `e` as split('\n') gives them (a trailing "\n" leaves an empty last line). */
+function splitLines(e) {
+  const n = e.length;
+  let k = 0;
+  let a = 0;
+  while (true) {
+    if (k === LS.length) {
+      const ls = new Int32Array(k * 2);
+      ls.set(LS);
+      LS = ls;
+      const le = new Int32Array(k * 2);
+      le.set(LE);
+      LE = le;
+    }
+    let b = e.indexOf('\n', a);
+    if (b === -1) b = n;
+    LS[k] = a;
+    LE[k] = b;
+    k++;
+    if (b === n) return k;
+    a = b + 1;
+  }
+}
+
+const isSpTab = (c) => c === 32 || c === 9;
+
+function blankR(e, a, b) {
+  for (let i = a; i < b; i++) if (!isSpTab(e.charCodeAt(i))) return false;
+  return true;
+}
+
+/** Whether e[a, b) holds U+2028 or U+2029 (only looked for when the body has one). */
+function ltR(e, a, b) {
+  for (let i = a; i < b; i++) {
+    const c = e.charCodeAt(i);
+    if (c === 0x2028 || c === 0x2029) return true;
+  }
+  return false;
+}
+
+const isLangChar = (c) => (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c === 95 || c === 43 || c === 45;
+
+/** A fence opener's language (/^```([A-Za-z0-9_+-]*)[ \t]*$/), or null. */
+function fenceOpenR(e, a, b) {
+  if (b - a < 3 || e.charCodeAt(a) !== 96 || e.charCodeAt(a + 1) !== 96 || e.charCodeAt(a + 2) !== 96) return null;
+  let k = a + 3;
+  while (k < b && isLangChar(e.charCodeAt(k))) k++;
+  const langEnd = k;
+  while (k < b && isSpTab(e.charCodeAt(k))) k++;
+  return k === b ? e.slice(a + 3, langEnd) : null;
+}
+
+function fenceCloseR(e, a, b) {
+  if (b - a < 3 || e.charCodeAt(a) !== 96 || e.charCodeAt(a + 1) !== 96 || e.charCodeAt(a + 2) !== 96) return false;
+  return blankR(e, a + 3, b);
+}
+
+/** /^(?:---|\*\*\*)[ \t]*$/ */
+function hrR(e, a, b) {
+  if (b - a < 3) return false;
+  const c = e.charCodeAt(a);
+  if ((c !== 45 && c !== 42) || e.charCodeAt(a + 1) !== c || e.charCodeAt(a + 2) !== c) return false;
+  return blankR(e, a + 3, b);
+}
+
+// A heading's parts, set by headingR: its depth and its text e[HA, HB).
+let HA = 0;
+let HB = 0;
+
+/** The depth of an ATX heading (/^(#{1,6})[ \t]+(.*?)[ \t]*$/ with a non-empty text), or 0; sets HA/HB. */
+function headingR(e, a, b) {
+  if (b - a < 2 || e.charCodeAt(a) !== 35) return 0;
+  let d = a + 1;
+  while (d < b && e.charCodeAt(d) === 35) d++;
+  const depth = d - a;
+  if (depth > 6 || d >= b || !isSpTab(e.charCodeAt(d))) return 0;
+  // `.` and [ \t] match no line terminator and `$` only the end, so one anywhere after the hashes fails the match.
+  if (bodyHasLT && ltR(e, d, b)) return 0;
+  let x = d + 1;
+  while (x < b && isSpTab(e.charCodeAt(x))) x++;
+  let y = b;
+  while (y > x && isSpTab(e.charCodeAt(y - 1))) y--;
+  if (x === y) return 0;
+  HA = x;
+  HB = y;
+  return depth;
+}
+
+/** Whether escaped line e[a, b) opens on ">" (written "&gt;"; a raw "&gt;" reads "&amp;gt;", so this is never it). */
+const quoteR = (e, a, b) => b - a >= 4 && e.charCodeAt(a) === 38 && e.startsWith('&gt;', a);
+
+/** Where the text of a bullet item starts (/^[-*] (.*)$/), or -1. */
+function bulletR(e, a, b) {
+  if (b - a < 2) return -1;
+  const c = e.charCodeAt(a);
+  if ((c !== 45 && c !== 42) || e.charCodeAt(a + 1) !== 32) return -1;
+  if (bodyHasLT && ltR(e, a + 2, b)) return -1;
+  return a + 2;
+}
+
+/** Where the text of an ordered item starts (/^(\d{1,9})\. (.*)$/), or -1; its number's digits end at OD. */
+let OD = 0;
+function orderedR(e, a, b) {
+  let i = a;
+  while (i < b && i - a < 10) {
+    const c = e.charCodeAt(i);
+    if (c < 48 || c > 57) break;
+    i++;
+  }
+  const nd = i - a;
+  if (nd === 0 || nd > 9 || i + 2 > b) return -1;
+  if (e.charCodeAt(i) !== 46 || e.charCodeAt(i + 1) !== 32) return -1;
+  if (bodyHasLT && ltR(e, i + 2, b)) return -1;
+  OD = i;
+  return i + 2;
+}
+
+/** /^ {2,}\S/ */
+function continuedR(e, a, b) {
+  if (b - a < 3 || e.charCodeAt(a) !== 32 || e.charCodeAt(a + 1) !== 32) return false;
+  let i = a + 2;
+  while (i < b && e.charCodeAt(i) === 32) i++;
+  return i < b && !isWs(e.charCodeAt(i));
+}
+
+function endsParagraphR(e, a, b) {
+  return blankR(e, a, b) || fenceOpenR(e, a, b) !== null || headingR(e, a, b) !== 0 || hrR(e, a, b);
+}
+
+// A trimmed range, set by trimR.
+let TA = 0;
+let TB = 0;
+function trimR(e, a, b) {
+  while (a < b && isSpTab(e.charCodeAt(a))) a++;
+  while (b > a && isSpTab(e.charCodeAt(b - 1))) b--;
+  TA = a;
+  TB = b;
+}
 
 /**
- * The body rendered: { html, toc, excerpt }. The body is HTML-escaped once, whole, and lexed as escaped lines: the
- * escape changes no character the block rules read but ">", which reads "&gt;" (isQuote), so the blocks are the
- * same; a heading's id is slugged from its text unescaped.
+ * The body rendered: { html, toc, excerpt }. The body is HTML-escaped once, whole, and lexed by positions: the
+ * escape changes no character the block rules read but ">", which reads "&gt;" (quoteR), so the blocks are the same;
+ * a heading's id is slugged from its text unescaped.
  */
 function renderMarkdown(src, env) {
-  bodyHasLT = src.includes('\u2028') || src.includes('\u2029');
-  const lines = escBig(src).split('\n');
-  const n = lines.length;
+  bodyHasLT = src.includes(' ') || src.includes(' ');
+  const e = escBig(src);
+  const n = splitLines(e);
   const ids = new Set();
   const toc = [];
   let excerpt = null;
   let html = '';
   let i = 0;
   while (i < n) {
-    const line = lines[i];
-    if (isBlank(line)) {
+    const a = LS[i];
+    const b = LE[i];
+    if (blankR(e, a, b)) {
       i++;
       continue;
     }
-    const lang = fenceOpen(line);
+    const lang = fenceOpenR(e, a, b);
     if (lang !== null) {
       i++;
-      let body = '';
-      while (i < n && !fenceClose(lines[i])) body += `${lines[i++]}\n`;
+      const first = i;
+      while (i < n && !fenceCloseR(e, LS[i], LE[i])) i++;
+      const body = i > first ? `${e.slice(LS[first], LE[i - 1])}\n` : '';
       i++;
       html += lang === '' ? `<pre><code>${body}</code></pre>\n` : `<pre><code class="language-${lang}">${body}</code></pre>\n`;
       continue;
     }
-    const heading = headingOf(line);
-    if (heading !== null) {
-      const id = uniqueSlug(slugify(unesc(heading.text)), ids);
-      const h = inlineE(heading.text, env);
-      html += `<h${heading.depth} id="${id}">${h}</h${heading.depth}>\n`;
-      if (heading.depth === 2 || heading.depth === 3) toc.push({ level: heading.depth, id, html: h });
+    const depth = headingR(e, a, b);
+    if (depth !== 0) {
+      const text = e.slice(HA, HB);
+      const id = uniqueSlug(slugify(unesc(text)), ids);
+      const h = inline(text, 0, text.length, env);
+      html += `<h${depth} id="${id}">${h}</h${depth}>\n`;
+      if (depth === 2 || depth === 3) toc.push({ level: depth, id, html: h });
       i++;
       continue;
     }
-    if (isHr(line)) {
+    if (hrR(e, a, b)) {
       html += '<hr>\n';
       i++;
       continue;
     }
-    if (isQuote(line)) {
+    if (quoteR(e, a, b)) {
       let text = '';
       let any = false;
-      while (i < n && isQuote(lines[i])) {
-        const l = trimST(unquoteE(lines[i++]));
-        if (l === '') continue;
-        text = any ? `${text}\n${l}` : l;
+      while (i < n && quoteR(e, LS[i], LE[i])) {
+        const qa = LS[i] + (e.charCodeAt(LS[i] + 4) === 32 && LS[i] + 4 < LE[i] ? 5 : 4);
+        trimR(e, qa, LE[i]);
+        i++;
+        if (TA === TB) continue;
+        text = any ? `${text}\n${e.slice(TA, TB)}` : e.slice(TA, TB);
         any = true;
       }
-      html += any ? `<blockquote>\n<p>${inlineE(text, env)}</p>\n</blockquote>\n` : '<blockquote>\n</blockquote>\n';
+      html += any ? `<blockquote>\n<p>${inline(text, 0, text.length, env)}</p>\n</blockquote>\n` : '<blockquote>\n</blockquote>\n';
       continue;
     }
-    const bullet = bulletOf(line);
-    const ordered = bullet === null ? orderedOf(line) : null;
-    if (bullet !== null || ordered !== null) {
-      const items = [];
+    let ta = bulletR(e, a, b);
+    const ordered = ta === -1;
+    if (ordered) ta = orderedR(e, a, b);
+    if (ta !== -1) {
+      const start = ordered ? Number(e.slice(a, OD)) : 1;
+      html += ordered ? (start !== 1 ? `<ol start="${start}">\n` : '<ol>\n') : '<ul>\n';
+      // items: each a range when one line, else its trimmed lines joined by "\n"
+      let ia = -1;
+      let ib = -1;
+      let multi = null;
       while (i < n) {
-        const l = lines[i];
-        const m = ordered !== null ? orderedOf(l) : bulletOf(l);
-        if (m !== null) {
-          items.push(trimST(ordered !== null ? m[1] : m));
+        const la = LS[i];
+        const lb = LE[i];
+        const m = ordered ? orderedR(e, la, lb) : bulletR(e, la, lb);
+        if (m !== -1) {
+          if (ia !== -1) html += `<li>${multi === null ? inline(e, ia, ib, env) : inline(multi, 0, multi.length, env)}</li>\n`;
+          trimR(e, m, lb);
+          ia = TA;
+          ib = TB;
+          multi = null;
           i++;
-        } else if (isContinued(l)) {
-          items[items.length - 1] += `\n${trimST(l)}`;
+        } else if (continuedR(e, la, lb)) {
+          trimR(e, la, lb);
+          multi = `${multi === null ? e.slice(ia, ib) : multi}\n${e.slice(TA, TB)}`;
           i++;
         } else break;
       }
-      let open;
-      let close;
-      if (ordered !== null) {
-        const start = Number(ordered[0]);
-        open = start !== 1 ? `<ol start="${start}">\n` : '<ol>\n';
-        close = '</ol>\n';
-      } else {
-        open = '<ul>\n';
-        close = '</ul>\n';
-      }
-      html += open;
-      for (const item of items) html += `<li>${inlineE(item, env)}</li>\n`;
-      html += close;
+      html += `<li>${multi === null ? inline(e, ia, ib, env) : inline(multi, 0, multi.length, env)}</li>\n`;
+      html += ordered ? '</ol>\n' : '</ul>\n';
       continue;
     }
-    let text = trimST(line);
+    // a paragraph: its lines trimmed and joined by "\n"; a range of e while no line needs trimming
+    trimR(e, a, b);
+    let pa = TA;
+    let pb = TB;
+    let text = null;
     i++;
-    while (i < n && !endsParagraph(lines[i])) text += `\n${trimST(lines[i++])}`;
-    const h = inlineE(text, env);
+    while (i < n && !endsParagraphR(e, LS[i], LE[i])) {
+      const la = LS[i];
+      const lb = LE[i];
+      trimR(e, la, lb);
+      if (text === null && pb === la - 1 && TA === la && TB === lb) pb = lb;
+      else text = `${text === null ? e.slice(pa, pb) : text}\n${e.slice(TA, TB)}`;
+      i++;
+    }
+    const h = text === null ? inline(e, pa, pb, env) : inline(text, 0, text.length, env);
     if (excerpt === null) excerpt = h;
     html += `<p>${h}</p>\n`;
   }
