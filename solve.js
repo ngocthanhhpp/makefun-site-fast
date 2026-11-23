@@ -401,9 +401,6 @@ function endsParagraph(line) {
   return isBlank(line) || fenceOpen(line) !== null || headingOf(line) !== null || isHr(line);
 }
 
-/** Drop a leading "> " or ">" (the caller knows the line opens on ">"). */
-const unquote = (l) => (l.charCodeAt(1) === 32 ? l.slice(2) : l.slice(1));
-
 /** First index in [from, end) of `what` (1 or 2 chars) outside a backslash escape, or -1. */
 function findUnescaped(s, what2, ch, from, end) {
   const lim = end - (what2 ? 2 : 1);
@@ -542,15 +539,34 @@ function inline(e, start, end, env) {
 
 const WS_ANY = /\s/;
 
-const inlineAll = (s, env) => {
-  const e = esc(s);
-  return inline(e, 0, e.length, env);
-};
+/** Already-escaped text `e` rendered inline. */
+const inlineE = (e, env) => inline(e, 0, e.length, env);
 
-/** The body rendered: { html, toc, excerpt }. */
+/** esc for a whole body: one native pass per character that occurs, better than a callback per match on long text. */
+function escBig(s) {
+  if (!ESC_TEST.test(s)) return s;
+  if (s.includes('&')) s = s.replaceAll('&', '&amp;');
+  if (s.includes('<')) s = s.replaceAll('<', '&lt;');
+  if (s.includes('>')) s = s.replaceAll('>', '&gt;');
+  if (s.includes('"')) s = s.replaceAll('"', '&quot;');
+  if (s.includes("'")) s = s.replaceAll("'", '&#39;');
+  return s;
+}
+
+/** Whether escaped line `l` opens on ">" (written "&gt;"; a raw "&gt;" reads "&amp;gt;", so this is never it). */
+const isQuote = (l) => l.length >= 4 && l.charCodeAt(0) === 38 && l.startsWith('&gt;');
+
+/** An escaped quote line without its ">" and one space after it. */
+const unquoteE = (l) => (l.charCodeAt(4) === 32 ? l.slice(5) : l.slice(4));
+
+/**
+ * The body rendered: { html, toc, excerpt }. The body is HTML-escaped once, whole, and lexed as escaped lines: the
+ * escape changes no character the block rules read but ">", which reads "&gt;" (isQuote), so the blocks are the
+ * same; a heading's id is slugged from its text unescaped.
+ */
 function renderMarkdown(src, env) {
   bodyHasLT = src.includes('\u2028') || src.includes('\u2029');
-  const lines = src.split('\n');
+  const lines = escBig(src).split('\n');
   const n = lines.length;
   const ids = new Set();
   const toc = [];
@@ -567,15 +583,15 @@ function renderMarkdown(src, env) {
     if (lang !== null) {
       i++;
       let body = '';
-      while (i < n && !fenceClose(lines[i])) body += `${esc(lines[i++])}\n`;
+      while (i < n && !fenceClose(lines[i])) body += `${lines[i++]}\n`;
       i++;
-      html += lang === '' ? `<pre><code>${body}</code></pre>\n` : `<pre><code class="language-${esc(lang)}">${body}</code></pre>\n`;
+      html += lang === '' ? `<pre><code>${body}</code></pre>\n` : `<pre><code class="language-${lang}">${body}</code></pre>\n`;
       continue;
     }
     const heading = headingOf(line);
     if (heading !== null) {
-      const id = uniqueSlug(slugify(heading.text), ids);
-      const h = inlineAll(heading.text, env);
+      const id = uniqueSlug(slugify(unesc(heading.text)), ids);
+      const h = inlineE(heading.text, env);
       html += `<h${heading.depth} id="${id}">${h}</h${heading.depth}>\n`;
       if (heading.depth === 2 || heading.depth === 3) toc.push({ level: heading.depth, id, html: h });
       i++;
@@ -586,16 +602,16 @@ function renderMarkdown(src, env) {
       i++;
       continue;
     }
-    if (line.charCodeAt(0) === 62) {
+    if (isQuote(line)) {
       let text = '';
       let any = false;
-      while (i < n && lines[i].length > 0 && lines[i].charCodeAt(0) === 62) {
-        const l = trimST(unquote(lines[i++]));
+      while (i < n && isQuote(lines[i])) {
+        const l = trimST(unquoteE(lines[i++]));
         if (l === '') continue;
         text = any ? `${text}\n${l}` : l;
         any = true;
       }
-      html += any ? `<blockquote>\n<p>${inlineAll(text, env)}</p>\n</blockquote>\n` : '<blockquote>\n</blockquote>\n';
+      html += any ? `<blockquote>\n<p>${inlineE(text, env)}</p>\n</blockquote>\n` : '<blockquote>\n</blockquote>\n';
       continue;
     }
     const bullet = bulletOf(line);
@@ -624,14 +640,14 @@ function renderMarkdown(src, env) {
         close = '</ul>\n';
       }
       html += open;
-      for (const item of items) html += `<li>${inlineAll(item, env)}</li>\n`;
+      for (const item of items) html += `<li>${inlineE(item, env)}</li>\n`;
       html += close;
       continue;
     }
     let text = trimST(line);
     i++;
     while (i < n && !endsParagraph(lines[i])) text += `\n${trimST(lines[i++])}`;
-    const h = inlineAll(text, env);
+    const h = inlineE(text, env);
     if (excerpt === null) excerpt = h;
     html += `<p>${h}</p>\n`;
   }
