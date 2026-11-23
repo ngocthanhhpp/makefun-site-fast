@@ -376,9 +376,11 @@ function headingOf(line) {
   let b = line.length;
   while (b > a && (line.charCodeAt(b - 1) === 32 || line.charCodeAt(b - 1) === 9)) b--;
   if (a === b) return null;
-  for (let i = a; i < b; i++) {
-    const t = line.charCodeAt(i);
-    if (t === 13 || t === 0x2028 || t === 0x2029) return headingSlow(line);
+  if (bodyHasLT) {
+    for (let i = a; i < b; i++) {
+      const t = line.charCodeAt(i);
+      if (t === 13 || t === 0x2028 || t === 0x2029) return headingSlow(line);
+    }
   }
   return { depth: d, text: line.slice(a, b) };
 }
@@ -415,7 +417,7 @@ function bulletOf(line) {
   if (line.length < 2) return null;
   const c = line.charCodeAt(0);
   if ((c !== 45 && c !== 42) || line.charCodeAt(1) !== 32) return null;
-  if (hasLineTerm(line, 2)) return null;
+  if (bodyHasLT && hasLineTerm(line, 2)) return null;
   return line.slice(2);
 }
 
@@ -429,9 +431,15 @@ function orderedOf(line) {
   }
   if (i === 0 || i > 9 || i + 2 > line.length) return null;
   if (line.charCodeAt(i) !== 46 || line.charCodeAt(i + 1) !== 32) return null;
-  if (hasLineTerm(line, i + 2)) return null;
+  if (bodyHasLT && hasLineTerm(line, i + 2)) return null;
   return [line.slice(0, i), line.slice(i + 2)];
 }
+
+/**
+ * Whether the body being rendered holds U+2028 or U+2029, the line terminators a regex `.` stops at beside \n (a
+ * source's \r is made \n before this), so the per-line checks for them run only on a body that has one.
+ */
+let bodyHasLT = false;
 
 function hasLineTerm(line, from) {
   for (let i = from; i < line.length; i++) {
@@ -593,6 +601,7 @@ const inlineAll = (s, env) => {
 
 /** The body rendered: { html, toc, excerpt }. */
 function renderMarkdown(src, env) {
+  bodyHasLT = src.includes('\u2028') || src.includes('\u2029');
   const lines = src.split('\n');
   const n = lines.length;
   const ids = new Set();
