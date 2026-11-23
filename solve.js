@@ -5,6 +5,32 @@
 // rendered once per build instead of once per page). No dependencies.
 
 const byCodeUnits = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
+
+/**
+ * Byte mode. main.ts reads the input file as Latin-1, so every string holds the file's UTF-8 bytes one per char
+ * (never decoded), and writes the answers back as Latin-1, so the bytes go out as they came. Every rule of the build
+ * reads ASCII characters, and UTF-8 never uses an ASCII byte inside a multi-byte character, so the build is the same
+ * on bytes; the few rules that read Unicode (slugs, \s and trim's whitespace, the line terminators a regex `.` stops
+ * at, code-unit order) are handled for bytes where they occur. BYTES says which form the current build reads.
+ */
+let BYTES = false;
+
+/** A byte-form string as the Unicode text it encodes. */
+const decodeU = (s) => Buffer.from(s, 'latin1').toString('utf8');
+
+/** Characters at or above U+00EE: in byte form, the lead bytes of U+E000 and up, where UTF-8 byte order and UTF-16
+ * code-unit order part ways (a supplementary character sorts before U+E000-U+FFFF in code units). */
+const HIGH = /[\u00ee-\uffff]/;
+
+/** Code-unit order of the texts the strings hold: in byte form, byte order is code-point order, the same order unless
+ * a string holds U+E000 or above; then the texts are decoded and compared. */
+function sortU(xs, key) {
+  if (BYTES && xs.some((x) => HIGH.test(key(x)))) {
+    const dec = new Map(xs.map((x) => [x, decodeU(key(x))]));
+    return xs.sort((x, y) => byCodeUnits(dec.get(x), dec.get(y)));
+  }
+  return xs.sort((x, y) => byCodeUnits(key(x), key(y)));
+}
 const RESERVED = ['posts', 'tags', 'page'];
 const REPORT_FILE = 'build-report.txt';
 
@@ -47,6 +73,7 @@ function escJ(s) {
 
 const MARK = /\p{M}/gu;
 const slugMemo = new Map();
+const slugMemoB = new Map(); // byte-form keys apart: one string can be a different text in each form
 
 function slugCore(plain) {
   let out = '';
@@ -74,7 +101,8 @@ function slugCore(plain) {
 
 /** The slug of `text` (NFKD, marks dropped, a-z0-9 runs joined by "-", at most 64, "untitled" when empty). */
 function slugify(text) {
-  let s = slugMemo.get(text);
+  const memo = BYTES ? slugMemoB : slugMemo;
+  let s = memo.get(text);
   if (s !== undefined) return s;
   let ascii = true;
   for (let i = 0; i < text.length; i++) {
@@ -84,8 +112,8 @@ function slugify(text) {
     }
   }
   // Non-ASCII code points are never kept, so walking code units gives the same gaps as walking code points.
-  s = slugCore(ascii ? text : text.normalize('NFKD').replace(MARK, ''));
-  slugMemo.set(text, s);
+  s = slugCore(ascii ? text : (BYTES ? decodeU(text) : text).normalize('NFKD').replace(MARK, ''));
+  memo.set(text, s);
   return s;
 }
 
@@ -115,22 +143,75 @@ function isWs(c) {
   return c === 160 || c === 0x1680 || (c >= 0x2000 && c <= 0x200a) || c === 0x2028 || c === 0x2029 || c === 0x202f || c === 0x205f || c === 0x3000 || c === 0xfeff;
 }
 
+/**
+ * The length of the \s whitespace character at `i` in `s`, or 0. In byte form the non-ASCII ones are UTF-8
+ * sequences: C2 A0, E1 9A 80, E2 80 80-8A, E2 80 A8, E2 80 A9, E2 80 AF, E2 81 9F, E3 80 80 and EF BB BF (each opens
+ * on a lead byte, so a match is always a whole character).
+ */
+function wsLen(s, i) {
+  const c = s.charCodeAt(i);
+  if (c < 128) return c === 32 || (c >= 9 && c <= 13) ? 1 : 0;
+  if (!BYTES) return isWs(c) ? 1 : 0;
+  if (i + 1 >= s.length) return 0;
+  const d = s.charCodeAt(i + 1);
+  if (c === 0xc2) return d === 0xa0 ? 2 : 0;
+  if (i + 2 >= s.length) return 0;
+  const f = s.charCodeAt(i + 2);
+  if (c === 0xe2) {
+    if (d === 0x80) return (f >= 0x80 && f <= 0x8a) || f === 0xa8 || f === 0xa9 || f === 0xaf ? 3 : 0;
+    return d === 0x81 && f === 0x9f ? 3 : 0;
+  }
+  if (c === 0xe1) return d === 0x9a && f === 0x80 ? 3 : 0;
+  if (c === 0xe3) return d === 0x80 && f === 0x80 ? 3 : 0;
+  if (c === 0xef) return d === 0xbb && f === 0xbf ? 3 : 0;
+  return 0;
+}
+
 /** How many runs of non-whitespace `text` holds (as /\S+/g counts them). */
 function wordsOf(text) {
   let n = 0;
   let inWord = false;
   const len = text.length;
-  for (let i = 0; i < len; i++) {
+  for (let i = 0; i < len; ) {
     const c = text.charCodeAt(i);
-    if (c > 32 && c < 160 ? true : !isWs(c)) {
+    const w = c > 32 && c < 128 ? 0 : wsLen(text, i);
+    if (w === 0) {
       if (!inWord) {
         inWord = true;
         n++;
       }
-    } else inWord = false;
+      i++;
+    } else {
+      inWord = false;
+      i += w;
+    }
   }
   return n;
 }
+
+/** Whether `s` holds any \s whitespace. */
+function hasWsU(s) {
+  for (let i = 0; i < s.length; i++) if (wsLen(s, i) !== 0) return true;
+  return false;
+}
+
+/** String.prototype.trim (its whitespace is \s's), in either form. */
+function trimU(s) {
+  if (!BYTES) return s.trim();
+  let a = 0;
+  let b = s.length;
+  for (let w; a < b && (w = wsLen(s, a)) !== 0; ) a += w;
+  while (b > a) {
+    if (wsLen(s, b - 1) === 1) b--;
+    else if (b - 2 >= a && wsLen(s, b - 2) === 2) b -= 2;
+    else if (b - 3 >= a && wsLen(s, b - 3) === 3) b -= 3;
+    else break;
+  }
+  return a === 0 && b === s.length ? s : s.slice(a, b);
+}
+
+/** Whether `s` holds U+2028 or U+2029, the line terminators beside \n and \r that a regex `.` does not match. */
+const hasLT = (s) => (BYTES ? s.includes('\u00e2\u0080\u00a8') || s.includes('\u00e2\u0080\u00a9') : s.includes('\u2028') || s.includes('\u2029'));
 
 /** Whether `s` is only spaces and tabs. */
 function isBlank(s) {
@@ -194,8 +275,8 @@ function valueOf(key, raw) {
     case 'tags': {
       if (raw.charCodeAt(0) !== 91 || raw.charCodeAt(raw.length - 1) !== 93) return { error: 'key "tags": not a list [a, b]' };
       const inner = raw.slice(1, -1);
-      if (inner.trim() === '') return { value: [] };
-      const tags = inner.split(',').map((t) => t.trim());
+      if (trimU(inner) === '') return { value: [] };
+      const tags = inner.split(',').map(trimU);
       for (const t of tags) if (t === '' || !FM_TAG.test(t)) return { error: 'key "tags": an empty tag, or one holding " [ or ]' };
       return { value: tags };
     }
@@ -247,7 +328,7 @@ function parseFrontMatter(text) {
   for (let k = 0; k < header.length; k++) {
     const line = header[k];
     if (isBlank(line) || line.charCodeAt(0) === 35) continue;
-    const m = FM_LINE.exec(line);
+    const m = BYTES && hasLT(line) ? null : FM_LINE.exec(line); // in byte form `.` would match a line terminator's bytes
     if (!m) return { error: `line ${k + 2} is not "key: value"` };
     const key = m[1];
     const raw = trimEndST(m[2] ?? '');
@@ -306,11 +387,6 @@ function findSingleStar(s, from, end) {
     return j;
   }
   return -1;
-}
-
-function hasWs(s) {
-  for (let i = 0; i < s.length; i++) if (isWs(s.charCodeAt(i))) return true;
-  return false;
 }
 
 /** The characters that open inline markup: \ ` * [ */
@@ -398,7 +474,7 @@ function inline(e, start, end, env) {
       const m = e.indexOf(')', k + 2);
       if (m !== -1 && m < end) {
         const target = unesc(e.slice(k + 2, m));
-        if (target !== '' && !WS_ANY.test(target)) {
+        if (target !== '' && !hasWsU(target)) {
           const href = esc(env.link(target));
           out += `<a href="${href}">${inline(e, i + 1, k, env)}</a>`;
           i = m + 1;
@@ -412,7 +488,6 @@ function inline(e, start, end, env) {
   return out;
 }
 
-const WS_ANY = /\s/;
 
 /** Already-escaped text `e` rendered inline. */
 const inlineE = (e, env) => inline(e, 0, e.length, env);
@@ -467,6 +542,15 @@ function blankR(e, a, b) {
 
 /** Whether e[a, b) holds U+2028 or U+2029 (only looked for when the body has one). */
 function ltR(e, a, b) {
+  if (BYTES) {
+    for (let i = a; i + 2 < b; i++) {
+      if (e.charCodeAt(i) === 0xe2 && e.charCodeAt(i + 1) === 0x80) {
+        const f = e.charCodeAt(i + 2);
+        if (f === 0xa8 || f === 0xa9) return true;
+      }
+    }
+    return false;
+  }
   for (let i = a; i < b; i++) {
     const c = e.charCodeAt(i);
     if (c === 0x2028 || c === 0x2029) return true;
@@ -556,7 +640,7 @@ function continuedR(e, a, b) {
   if (b - a < 3 || e.charCodeAt(a) !== 32 || e.charCodeAt(a + 1) !== 32) return false;
   let i = a + 2;
   while (i < b && e.charCodeAt(i) === 32) i++;
-  return i < b && !isWs(e.charCodeAt(i));
+  return i < b && wsLen(e, i) === 0;
 }
 
 function endsParagraphR(e, a, b) {
@@ -579,7 +663,7 @@ function trimR(e, a, b) {
  * a heading's id is slugged from its text unescaped.
  */
 function renderMarkdown(src, env) {
-  bodyHasLT = src.includes(' ') || src.includes(' ');
+  bodyHasLT = hasLT(src);
   const e = escBig(src);
   const n = splitLines(e);
   const ids = new Set();
@@ -691,6 +775,16 @@ const INCLUDE_DEPTH = 8;
 const T_PATH = /^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$/;
 const T_FOR = /^for ([A-Za-z_][A-Za-z0-9_]*) in (\S+)$/;
 const T_IF = /^if (not )?(\S+)$/;
+
+/**
+ * A tag regex's match. In byte form \S reads the char A0 as no-break space, which it is only after C2: a tag holding
+ * an A0 is matched on its decoded text, its groups encoded back.
+ */
+function execTag(re, tag) {
+  if (!BYTES || !tag.includes('\u00a0')) return re.exec(tag);
+  const m = re.exec(decodeU(tag));
+  return m === null ? null : m.map((g) => (g === undefined ? g : Buffer.from(g, 'utf8').toString('latin1')));
+}
 const T_INCLUDE = /^include "([a-z0-9-]+)"$/;
 
 class TemplateError extends Error {}
@@ -725,7 +819,7 @@ function tokenize(name, src) {
       if (close === -1) throw new TemplateError(`template "${name}": a ${raw ? '{{{' : '{{'} is not closed`);
       if (text !== '') tokens.push({ t: 'text', text });
       text = '';
-      tokens.push({ t: raw ? 'raw' : 'var', path: pathOf(name, src.slice(open + (raw ? 3 : 2), close).trim()) });
+      tokens.push({ t: raw ? 'raw' : 'var', path: pathOf(name, trimU(src.slice(open + (raw ? 3 : 2), close))) });
       i = close + (raw ? 3 : 2);
       continue;
     }
@@ -739,7 +833,7 @@ function tokenize(name, src) {
     if (standalone) text = text.slice(0, text.length - (open - lineStart));
     if (text !== '') tokens.push({ t: 'text', text });
     text = '';
-    tokens.push({ t: 'tag', tag: src.slice(open + 2, close).trim() });
+    tokens.push({ t: 'tag', tag: trimU(src.slice(open + 2, close)) });
     i = standalone ? (nl === -1 ? src.length : nl + 1) : end;
   }
   if (text !== '') tokens.push({ t: 'text', text });
@@ -758,12 +852,12 @@ function parseTemplate(name, src) {
       const tag = tok.tag;
       const top = stack[stack.length - 1];
       let m;
-      if ((m = T_FOR.exec(tag)) !== null) {
+      if ((m = execTag(T_FOR, tag)) !== null) {
         const node = { kind: 'for', name: m[1], path: pathOf(name, m[2]), body: [] };
         body.push(node);
         stack.push(node);
         body = node.body;
-      } else if ((m = T_IF.exec(tag)) !== null) {
+      } else if ((m = execTag(T_IF, tag)) !== null) {
         const node = { kind: 'if', not: m[1] !== undefined, path: pathOf(name, m[2]), then: [], else: null };
         body.push(node);
         stack.push(node);
@@ -1050,7 +1144,7 @@ function hasScheme(t) {
 function build(input) {
   const report = [];
   const trees = new Map();
-  for (const name of Object.keys(input.templates).sort(byCodeUnits)) {
+  for (const name of sortU(Object.keys(input.templates), (x) => x)) {
     try {
       trees.set(name, parseTemplate(name, input.templates[name]));
     } catch (err) {
@@ -1061,7 +1155,7 @@ function build(input) {
   const base = input.site.base_url.replace(/\/+$/, '');
 
   // 1. sources in code-unit order of their paths
-  const files = [...input.files].sort((x, y) => byCodeUnits(x.path, y.path));
+  const files = sortU([...input.files], (f) => f.path);
   let sources = [];
   const statics = [];
   for (const f of files) {
@@ -1288,7 +1382,7 @@ function build(input) {
   }
 
   // 8. report
-  const lines = [...report, ...broken].sort(byCodeUnits);
+  const lines = sortU([...report, ...broken], (x) => x);
   let nPages = 0;
   for (const s of sources) if (!s.post) nPages++;
   lines.push(`built ${nPages} pages, ${posts.length} posts, ${tags.length} tags and ${statics.length} static files`);
@@ -1296,8 +1390,8 @@ function build(input) {
   return output;
 }
 
-/** One case's answer, the output tree, as JSON text: what JSON.stringify(run(input)) reads back as. */
-export function runJson(input) {
+/** The JSON text of one build's output tree, in the current form. */
+function treeJson(input) {
   let out = '{';
   let first = true;
   for (const [path, json] of build(input)) {
@@ -1305,6 +1399,43 @@ export function runJson(input) {
     first = false;
   }
   return `${out}}`;
+}
+
+/** One case's answer, the output tree, as JSON text: what JSON.stringify(run(input)) reads back as. */
+export function runJson(input) {
+  BYTES = false;
+  return treeJson(input);
+}
+
+/** runJson for an input in byte form (its strings the UTF-8 bytes of the text, one per char), answering in byte form. */
+export function runJsonBytes(input) {
+  BYTES = true;
+  try {
+    return treeJson(input);
+  } finally {
+    BYTES = false;
+  }
+}
+
+/** A \uD800-\uDFFF escape: JSON.parse makes it a char no byte holds, so such a file is read as Unicode text. */
+const SURROGATE_ESCAPE = /\\u[dD][89a-fA-F]/;
+
+/**
+ * Every answer for a cases.json whose bytes are `raw` (read as Latin-1), handed to `emit(text, encoding)` in order:
+ * "[", the answers joined by ",", "]". Read and answered in byte form, or as Unicode text when the file holds a
+ * surrogate escape.
+ */
+export function answerFile(raw, emit) {
+  const bytes = !SURROGATE_ESCAPE.test(raw);
+  const enc = bytes ? 'latin1' : 'utf8';
+  const cases = JSON.parse(bytes ? raw : decodeU(raw));
+  emit('[', enc);
+  for (let i = 0; i < cases.length; i++) {
+    if (i > 0) emit(',', enc);
+    emit(bytes ? runJsonBytes(cases[i].input) : runJson(cases[i].input), enc);
+    cases[i] = null; // its input is garbage from here
+  }
+  emit(']', enc);
 }
 
 /** makefun-site 1.0.0's answer for one case's input: its output tree, path -> text. */
