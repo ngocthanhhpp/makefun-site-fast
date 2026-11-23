@@ -10,27 +10,16 @@ const REPORT_FILE = 'build-report.txt';
 
 // ------------------------------------------------------------------ text
 
-/** & < > " ' escaped; returns the input itself when nothing needs escaping. */
+/** & < > " ' escaped; returns the input itself when nothing needs escaping. Native searches, fast even when cold. */
+const ESC_TEST = /[&<>"']/;
 function esc(s) {
-  let out = '';
-  let last = 0;
-  const n = s.length;
-  for (let i = 0; i < n; i++) {
-    const c = s.charCodeAt(i);
-    if (c > 62) continue;
-    let r;
-    if (c === 38) r = '&amp;';
-    else if (c === 60) r = '&lt;';
-    else if (c === 62) r = '&gt;';
-    else if (c === 34) r = '&quot;';
-    else if (c === 39) r = '&#39;';
-    else continue;
-    if (i > last) out += s.slice(last, i);
-    out += r;
-    last = i + 1;
-  }
-  if (last === 0) return s;
-  return last < n ? out + s.slice(last) : out;
+  if (!ESC_TEST.test(s)) return s;
+  if (s.includes('&')) s = s.replaceAll('&', '&amp;');
+  if (s.includes('<')) s = s.replaceAll('<', '&lt;');
+  if (s.includes('>')) s = s.replaceAll('>', '&gt;');
+  if (s.includes('"')) s = s.replaceAll('"', '&quot;');
+  if (s.includes("'")) s = s.replaceAll("'", '&#39;');
+  return s;
 }
 
 /** Escape of one character code (for the inline renderer's escaped characters). */
@@ -179,17 +168,10 @@ function isWs(c) {
 }
 
 /** How many runs of non-whitespace `text` holds. */
+const WORD = /\S+/g;
 function wordsOf(text) {
-  let n = 0;
-  let inWord = false;
-  for (let i = 0; i < text.length; i++) {
-    if (isWs(text.charCodeAt(i))) inWord = false;
-    else if (!inWord) {
-      inWord = true;
-      n++;
-    }
-  }
-  return n;
+  const m = text.match(WORD);
+  return m === null ? 0 : m.length;
 }
 
 /** Spaces and tabs at either end dropped. */
@@ -491,97 +473,111 @@ function hasWs(s) {
   return false;
 }
 
-/** s[start, end) rendered inline. */
-function inline(s, start, end, env) {
+/** The characters that open inline markup: \ ` * [ */
+const OPENER = /[\\`*[]/g;
+
+/** A link target back from its escaped form (the five entities esc writes). */
+function unesc(t) {
+  if (!t.includes('&')) return t;
+  return t.replaceAll('&lt;', '<').replaceAll('&gt;', '>').replaceAll('&quot;', '"').replaceAll('&#39;', "'").replaceAll('&amp;', '&');
+}
+
+/**
+ * e[start, end) rendered inline, where `e` is the block's text already HTML-escaped (esc). Escaping maps each
+ * character on its own and its entities hold none of \ ` * [ ] ( ), so the markup is found at the same places and
+ * every plain run, code span and link label comes out escaped already. Two places differ: "\>" ('>' is escapable)
+ * reads "\&gt;" here, and a link's target is resolved from its raw text.
+ */
+function inline(e, start, end, env) {
   let out = '';
   let i = start;
-  let run = start; // start of the pending plain run
   while (i < end) {
-    const c = s.charCodeAt(i);
-    if (c >= 128 || STOP[c] === 0) {
-      i++;
-      continue;
+    OPENER.lastIndex = i;
+    let j = OPENER.test(e) ? OPENER.lastIndex - 1 : end;
+    if (j >= end) {
+      out += i === 0 && end === e.length ? e : e.slice(i, end);
+      break;
     }
-    if (c === 38 || c === 60 || c === 62 || c === 34 || c === 39) {
-      if (i > run) out += s.slice(run, i);
-      out += escCode(c);
-      i++;
-      run = i;
-      continue;
-    }
+    if (j > i) out += e.slice(i, j);
+    i = j;
+    const c = e.charCodeAt(i);
     if (c === 92) {
-      if (i + 1 < end && isEscapable(s.charCodeAt(i + 1))) {
-        if (i > run) out += s.slice(run, i);
-        out += escCode(s.charCodeAt(i + 1));
-        i += 2;
-        run = i;
-      } else i++;
+      if (i + 1 < end) {
+        const n = e.charCodeAt(i + 1);
+        if (isEscapable(n)) {
+          out += e[i + 1];
+          i += 2;
+          continue;
+        }
+        if (n === 38 && e.startsWith('&gt;', i + 1)) {
+          out += '&gt;';
+          i += 5;
+          continue;
+        }
+      }
+      out += '\\';
+      i++;
       continue;
     }
-    if (i > run) out += s.slice(run, i);
     if (c === 96) {
-      let j = s.indexOf('`', i + 1);
-      if (j >= end) j = -1;
-      if (j > i + 1) {
-        out += `<code>${esc(s.slice(i + 1, j))}</code>`;
-        i = j + 1;
+      const k = e.indexOf('`', i + 1);
+      if (k !== -1 && k < end && k > i + 1) {
+        out += `<code>${e.slice(i + 1, k)}</code>`;
+        i = k + 1;
       } else {
         out += '`';
         i++;
       }
-      run = i;
       continue;
     }
     if (c === 42) {
-      if (i + 1 < end && s.charCodeAt(i + 1) === 42) {
-        const j = findUnescaped(s, true, 42, i + 2, end);
-        if (j > i + 2) {
-          out += `<strong>${inline(s, i + 2, j, env)}</strong>`;
-          i = j + 2;
+      if (i + 1 < end && e.charCodeAt(i + 1) === 42) {
+        const k = findUnescaped(e, true, 42, i + 2, end);
+        if (k > i + 2) {
+          out += `<strong>${inline(e, i + 2, k, env)}</strong>`;
+          i = k + 2;
         } else {
           out += '**';
           i += 2;
         }
-        run = i;
         continue;
       }
-      const j = findSingleStar(s, i + 1, end);
-      if (j > i + 1) {
-        out += `<em>${inline(s, i + 1, j, env)}</em>`;
-        i = j + 1;
+      const k = findSingleStar(e, i + 1, end);
+      if (k > i + 1) {
+        out += `<em>${inline(e, i + 1, k, env)}</em>`;
+        i = k + 1;
       } else {
         out += '*';
         i++;
       }
-      run = i;
       continue;
     }
     // c === '['
-    const k = findUnescaped(s, false, 93, i + 1, end);
-    let m = -1;
-    if (k !== -1 && k + 1 < end && s.charCodeAt(k + 1) === 40) {
-      m = s.indexOf(')', k + 2);
-      if (m >= end) m = -1;
-    }
-    if (m !== -1) {
-      const target = s.slice(k + 2, m);
-      if (target !== '' && !hasWs(target)) {
-        const href = esc(env.link(target));
-        out += `<a href="${href}">${inline(s, i + 1, k, env)}</a>`;
-        i = m + 1;
-        run = i;
-        continue;
+    const k = findUnescaped(e, false, 93, i + 1, end);
+    if (k !== -1 && k + 1 < end && e.charCodeAt(k + 1) === 40) {
+      const m = e.indexOf(')', k + 2);
+      if (m !== -1 && m < end) {
+        const target = unesc(e.slice(k + 2, m));
+        if (target !== '' && !WS_ANY.test(target)) {
+          const href = esc(env.link(target));
+          out += `<a href="${href}">${inline(e, i + 1, k, env)}</a>`;
+          i = m + 1;
+          continue;
+        }
       }
     }
     out += '[';
     i++;
-    run = i;
   }
-  if (end > run) out += run === 0 && end === s.length ? s : s.slice(run, end);
   return out;
 }
 
-const inlineAll = (s, env) => inline(s, 0, s.length, env);
+const WS_ANY = /\s/;
+
+const inlineAll = (s, env) => {
+  const e = esc(s);
+  return inline(e, 0, e.length, env);
+};
 
 /** The body rendered: { html, toc, excerpt }. */
 function renderMarkdown(src, env) {
