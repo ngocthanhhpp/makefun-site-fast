@@ -5,7 +5,10 @@
 import { readFileSync, writeFileSync } from 'node:fs';
 import { setFlagsFromString } from 'node:v8';
 
-setFlagsFromString('--no-incremental-marking');
+// V8 tuned for one short cold run (the rules let an entry tune V8's flags as the baseline does): incremental marking
+// off, as the baseline has it; the Maglev tier on, with TurboFan held back, since on a run this short TurboFan's
+// compile time (on its background thread, counted as CPU time too) costs more than its faster code saves.
+for (const flag of ['--no-incremental-marking', '--maglev', '--invocation-count-for-turbofan=100000']) setFlagsFromString(flag);
 
 const { runJson } = (await import(new URL('./solve.js', import.meta.url).href)) as { runJson: (input: unknown) => string };
 
