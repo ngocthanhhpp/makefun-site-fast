@@ -167,11 +167,21 @@ function isWs(c) {
   return c === 160 || c === 0x1680 || (c >= 0x2000 && c <= 0x200a) || c === 0x2028 || c === 0x2029 || c === 0x202f || c === 0x205f || c === 0x3000 || c === 0xfeff;
 }
 
-/** How many runs of non-whitespace `text` holds. */
-const WORD = /\S+/g;
+/** How many runs of non-whitespace `text` holds (as /\S+/g counts them). */
 function wordsOf(text) {
-  const m = text.match(WORD);
-  return m === null ? 0 : m.length;
+  let n = 0;
+  let inWord = false;
+  const len = text.length;
+  for (let i = 0; i < len; i++) {
+    const c = text.charCodeAt(i);
+    if (c > 32 && c < 160 ? true : !isWs(c)) {
+      if (!inWord) {
+        inWord = true;
+        n++;
+      }
+    } else inWord = false;
+  }
+  return n;
 }
 
 /** Spaces and tabs at either end dropped. */
@@ -337,14 +347,14 @@ const FENCE_OPEN = /^```([A-Za-z0-9_+-]*)[ \t]*$/;
 
 /** A fence opener's language, or null. */
 function fenceOpen(line) {
-  if (line.charCodeAt(0) !== 96 || line.charCodeAt(1) !== 96 || line.charCodeAt(2) !== 96) return null;
+  if (line.length < 3 || line.charCodeAt(0) !== 96 || line.charCodeAt(1) !== 96 || line.charCodeAt(2) !== 96) return null;
   const m = FENCE_OPEN.exec(line);
   return m === null ? null : m[1];
 }
 
 /** Whether `line` closes a fence: ``` then only spaces and tabs. */
 function fenceClose(line) {
-  if (line.charCodeAt(0) !== 96 || line.charCodeAt(1) !== 96 || line.charCodeAt(2) !== 96) return false;
+  if (line.length < 3 || line.charCodeAt(0) !== 96 || line.charCodeAt(1) !== 96 || line.charCodeAt(2) !== 96) return false;
   for (let i = 3; i < line.length; i++) {
     const c = line.charCodeAt(i);
     if (c !== 32 && c !== 9) return false;
@@ -354,10 +364,10 @@ function fenceClose(line) {
 
 /** depth and text of an ATX heading, or null. /^(#{1,6})[ \t]+(.*?)[ \t]*$/ with a non-empty text. */
 function headingOf(line) {
-  if (line.charCodeAt(0) !== 35) return null;
+  if (line.length < 2 || line.charCodeAt(0) !== 35) return null;
   let d = 1;
   while (d < line.length && line.charCodeAt(d) === 35) d++;
-  if (d > 6) return null;
+  if (d > 6 || d >= line.length) return null;
   const c = line.charCodeAt(d);
   if (c !== 32 && c !== 9) return null;
   // `.` in the regex does not cross line terminators; lines hold no \n, but \r, \u2028, \u2029 may appear.
@@ -381,6 +391,7 @@ function headingSlow(line) {
 
 /** /^(?:---|\*\*\*)[ \t]*$/ */
 function isHr(line) {
+  if (line.length < 3) return false;
   const c = line.charCodeAt(0);
   if (c !== 45 && c !== 42) return false;
   if (line.charCodeAt(1) !== c || line.charCodeAt(2) !== c) return false;
@@ -393,7 +404,7 @@ function isHr(line) {
 
 /** /^ {2,}\S/ */
 function isContinued(line) {
-  if (line.charCodeAt(0) !== 32 || line.charCodeAt(1) !== 32) return false;
+  if (line.length < 3 || line.charCodeAt(0) !== 32 || line.charCodeAt(1) !== 32) return false;
   let i = 2;
   while (i < line.length && line.charCodeAt(i) === 32) i++;
   return i < line.length && !isWs(line.charCodeAt(i));
@@ -401,6 +412,7 @@ function isContinued(line) {
 
 /** The text after "- " or "* ", or null. /^[-*] (.*)$/ (`.` stops at \r, \u2028, \u2029). */
 function bulletOf(line) {
+  if (line.length < 2) return null;
   const c = line.charCodeAt(0);
   if ((c !== 45 && c !== 42) || line.charCodeAt(1) !== 32) return null;
   if (hasLineTerm(line, 2)) return null;
@@ -415,7 +427,7 @@ function orderedOf(line) {
     if (c < 48 || c > 57) break;
     i++;
   }
-  if (i === 0 || i > 9) return null;
+  if (i === 0 || i > 9 || i + 2 > line.length) return null;
   if (line.charCodeAt(i) !== 46 || line.charCodeAt(i + 1) !== 32) return null;
   if (hasLineTerm(line, i + 2)) return null;
   return [line.slice(0, i), line.slice(i + 2)];
@@ -620,7 +632,7 @@ function renderMarkdown(src, env) {
     if (line.charCodeAt(0) === 62) {
       let text = '';
       let any = false;
-      while (i < n && lines[i].charCodeAt(0) === 62) {
+      while (i < n && lines[i].length > 0 && lines[i].charCodeAt(0) === 62) {
         const l = trimST(unquote(lines[i++]));
         if (l === '') continue;
         text = any ? `${text}\n${l}` : l;
