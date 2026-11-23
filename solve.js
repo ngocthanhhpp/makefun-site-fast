@@ -10,16 +10,13 @@ const REPORT_FILE = 'build-report.txt';
 
 // ------------------------------------------------------------------ text
 
-/** & < > " ' escaped; returns the input itself when nothing needs escaping. Native searches, fast even when cold. */
+/** & < > " ' escaped; returns the input itself when nothing needs escaping. Native regex work, fast even when cold. */
 const ESC_TEST = /[&<>"']/;
+const ESC_ALL = /[&<>"']/g;
+const ESC_MAP = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+const escOne = (c) => ESC_MAP[c];
 function esc(s) {
-  if (!ESC_TEST.test(s)) return s;
-  if (s.includes('&')) s = s.replaceAll('&', '&amp;');
-  if (s.includes('<')) s = s.replaceAll('<', '&lt;');
-  if (s.includes('>')) s = s.replaceAll('>', '&gt;');
-  if (s.includes('"')) s = s.replaceAll('"', '&quot;');
-  if (s.includes("'")) s = s.replaceAll("'", '&#39;');
-  return s;
+  return ESC_TEST.test(s) ? s.replace(ESC_ALL, escOne) : s;
 }
 
 /** Escape of one character code (for the inline renderer's escaped characters). */
@@ -32,69 +29,20 @@ function escCode(c) {
   return String.fromCharCode(c);
 }
 
-/** JSON string escape (no quotes): " \ control characters and lone surrogates; the input itself when none. */
+/**
+ * JSON string escape, without the quotes: what JSON.stringify writes between them (" \ control characters and lone
+ * surrogates escaped); the input itself when it needs none.
+ */
+const JSON_TEST = /["\\\u0000-\u001f\ud800-\udfff]/;
 function jesc(s) {
-  if (s.length > 24) return JSON.stringify(s).slice(1, -1); // native escaping wins on long text
-  let out = '';
-  let last = 0;
-  const n = s.length;
-  for (let i = 0; i < n; i++) {
-    const c = s.charCodeAt(i);
-    if (c >= 93 && c < 0xd800) continue;
-    let r;
-    if (c === 34) r = '\\"';
-    else if (c === 92) r = '\\\\';
-    else if (c < 32) r = c === 10 ? '\\n' : c === 9 ? '\\t' : c === 13 ? '\\r' : `\\u${c.toString(16).padStart(4, '0')}`;
-    else if (c >= 0xd800 && c <= 0xdfff) {
-      if (c <= 0xdbff && i + 1 < n) {
-        const d = s.charCodeAt(i + 1);
-        if (d >= 0xdc00 && d <= 0xdfff) {
-          i++;
-          continue;
-        }
-      }
-      r = `\\u${c.toString(16)}`;
-    } else continue;
-    if (i > last) out += s.slice(last, i);
-    out += r;
-    last = i + 1;
-  }
-  if (last === 0) return s;
-  return last < n ? out + s.slice(last) : out;
+  return JSON_TEST.test(s) ? JSON.stringify(s).slice(1, -1) : s;
 }
 
-/** HTML escape then JSON escape, in one pass. */
+/** HTML escape then JSON escape (after the HTML escape no " is left for JSON to escape). */
+const JSON_TEST_NQ = /[\\\u0000-\u001f\ud800-\udfff]/;
 function escJ(s) {
-  let out = '';
-  let last = 0;
-  const n = s.length;
-  for (let i = 0; i < n; i++) {
-    const c = s.charCodeAt(i);
-    if (c >= 93 && c < 0xd800) continue;
-    let r;
-    if (c === 38) r = '&amp;';
-    else if (c === 60) r = '&lt;';
-    else if (c === 62) r = '&gt;';
-    else if (c === 34) r = '&quot;';
-    else if (c === 39) r = '&#39;';
-    else if (c === 92) r = '\\\\';
-    else if (c < 32) r = c === 10 ? '\\n' : c === 9 ? '\\t' : c === 13 ? '\\r' : `\\u${c.toString(16).padStart(4, '0')}`;
-    else if (c >= 0xd800 && c <= 0xdfff) {
-      if (c <= 0xdbff && i + 1 < n) {
-        const d = s.charCodeAt(i + 1);
-        if (d >= 0xdc00 && d <= 0xdfff) {
-          i++;
-          continue;
-        }
-      }
-      r = `\\u${c.toString(16)}`;
-    } else continue;
-    if (i > last) out += s.slice(last, i);
-    out += r;
-    last = i + 1;
-  }
-  if (last === 0) return s;
-  return last < n ? out + s.slice(last) : out;
+  if (ESC_TEST.test(s)) s = s.replace(ESC_ALL, escOne);
+  return JSON_TEST_NQ.test(s) ? JSON.stringify(s).slice(1, -1) : s;
 }
 
 const MARK = /\p{M}/gu;
