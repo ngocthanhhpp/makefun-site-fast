@@ -1217,7 +1217,11 @@ function build(input) {
       date_long: date === undefined ? '' : longDate(date),
       summary: s.data.summary ?? '',
       excerpt: s.excerpt,
-      reading_minutes: Math.max(1, Math.ceil(wordsOf(s.body) / 200)),
+      // counted on first read: a layout that never shows it never pays for the word count
+      get reading_minutes() {
+        if (s.minutes === undefined) s.minutes = Math.max(1, Math.ceil(wordsOf(s.body) / 200));
+        return s.minutes;
+      },
       tags: s.tagRefs.map((t) => ({ name: t.name, slug: t.slug, url: t.url })),
     };
   };
@@ -1248,7 +1252,9 @@ function build(input) {
       date_long: card.date_long,
       summary: card.summary,
       excerpt: card.excerpt,
-      reading_minutes: card.reading_minutes,
+      get reading_minutes() {
+        return card.reading_minutes;
+      },
       tags: card.tags,
       slug: s.slug,
       content: s.html,
