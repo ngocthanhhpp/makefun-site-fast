@@ -132,23 +132,6 @@ function wordsOf(text) {
   return n;
 }
 
-/** Spaces and tabs at either end dropped. */
-function trimST(s) {
-  let a = 0;
-  let b = s.length;
-  while (a < b) {
-    const c = s.charCodeAt(a);
-    if (c !== 32 && c !== 9) break;
-    a++;
-  }
-  while (b > a) {
-    const c = s.charCodeAt(b - 1);
-    if (c !== 32 && c !== 9) break;
-    b--;
-  }
-  return a === 0 && b === s.length ? s : s.slice(a, b);
-}
-
 /** Whether `s` is only spaces and tabs. */
 function isBlank(s) {
   for (let i = 0; i < s.length; i++) {
@@ -287,119 +270,11 @@ const ESCAPABLE = new Uint8Array(128);
 for (const ch of '\\`*_[]()#+-.!>') ESCAPABLE[ch.charCodeAt(0)] = 1;
 const isEscapable = (c) => c < 128 && ESCAPABLE[c] === 1;
 
-/** Characters the inline scanner stops at: \ ` * [ and the escaped & < > " ' */
-const STOP = new Uint8Array(128);
-for (const ch of '\\`*[&<>"\'') STOP[ch.charCodeAt(0)] = 1;
-
-const FENCE_OPEN = /^```([A-Za-z0-9_+-]*)[ \t]*$/;
-
-/** A fence opener's language, or null. */
-function fenceOpen(line) {
-  if (line.length < 3 || line.charCodeAt(0) !== 96 || line.charCodeAt(1) !== 96 || line.charCodeAt(2) !== 96) return null;
-  const m = FENCE_OPEN.exec(line);
-  return m === null ? null : m[1];
-}
-
-/** Whether `line` closes a fence: ``` then only spaces and tabs. */
-function fenceClose(line) {
-  if (line.length < 3 || line.charCodeAt(0) !== 96 || line.charCodeAt(1) !== 96 || line.charCodeAt(2) !== 96) return false;
-  for (let i = 3; i < line.length; i++) {
-    const c = line.charCodeAt(i);
-    if (c !== 32 && c !== 9) return false;
-  }
-  return true;
-}
-
-/** depth and text of an ATX heading, or null. /^(#{1,6})[ \t]+(.*?)[ \t]*$/ with a non-empty text. */
-function headingOf(line) {
-  if (line.length < 2 || line.charCodeAt(0) !== 35) return null;
-  let d = 1;
-  while (d < line.length && line.charCodeAt(d) === 35) d++;
-  if (d > 6 || d >= line.length) return null;
-  const c = line.charCodeAt(d);
-  if (c !== 32 && c !== 9) return null;
-  // `.` in the regex does not cross line terminators; lines hold no \n, but \r, \u2028, \u2029 may appear.
-  let a = d + 1;
-  while (a < line.length && (line.charCodeAt(a) === 32 || line.charCodeAt(a) === 9)) a++;
-  let b = line.length;
-  while (b > a && (line.charCodeAt(b - 1) === 32 || line.charCodeAt(b - 1) === 9)) b--;
-  if (a === b) return null;
-  if (bodyHasLT) {
-    for (let i = a; i < b; i++) {
-      const t = line.charCodeAt(i);
-      if (t === 13 || t === 0x2028 || t === 0x2029) return headingSlow(line);
-    }
-  }
-  return { depth: d, text: line.slice(a, b) };
-}
-
-const HEADING = /^(#{1,6})[ \t]+(.*?)[ \t]*$/;
-function headingSlow(line) {
-  const m = HEADING.exec(line);
-  return m === null || m[2] === '' ? null : { depth: m[1].length, text: m[2] };
-}
-
-/** /^(?:---|\*\*\*)[ \t]*$/ */
-function isHr(line) {
-  if (line.length < 3) return false;
-  const c = line.charCodeAt(0);
-  if (c !== 45 && c !== 42) return false;
-  if (line.charCodeAt(1) !== c || line.charCodeAt(2) !== c) return false;
-  for (let i = 3; i < line.length; i++) {
-    const t = line.charCodeAt(i);
-    if (t !== 32 && t !== 9) return false;
-  }
-  return true;
-}
-
-/** /^ {2,}\S/ */
-function isContinued(line) {
-  if (line.length < 3 || line.charCodeAt(0) !== 32 || line.charCodeAt(1) !== 32) return false;
-  let i = 2;
-  while (i < line.length && line.charCodeAt(i) === 32) i++;
-  return i < line.length && !isWs(line.charCodeAt(i));
-}
-
-/** The text after "- " or "* ", or null. /^[-*] (.*)$/ (`.` stops at \r, \u2028, \u2029). */
-function bulletOf(line) {
-  if (line.length < 2) return null;
-  const c = line.charCodeAt(0);
-  if ((c !== 45 && c !== 42) || line.charCodeAt(1) !== 32) return null;
-  if (bodyHasLT && hasLineTerm(line, 2)) return null;
-  return line.slice(2);
-}
-
-/** [start, text] of an ordered item, or null. /^(\d{1,9})\. (.*)$/ */
-function orderedOf(line) {
-  let i = 0;
-  while (i < line.length && i < 10) {
-    const c = line.charCodeAt(i);
-    if (c < 48 || c > 57) break;
-    i++;
-  }
-  if (i === 0 || i > 9 || i + 2 > line.length) return null;
-  if (line.charCodeAt(i) !== 46 || line.charCodeAt(i + 1) !== 32) return null;
-  if (bodyHasLT && hasLineTerm(line, i + 2)) return null;
-  return [line.slice(0, i), line.slice(i + 2)];
-}
-
 /**
  * Whether the body being rendered holds U+2028 or U+2029, the line terminators a regex `.` stops at beside \n (a
  * source's \r is made \n before this), so the per-line checks for them run only on a body that has one.
  */
 let bodyHasLT = false;
-
-function hasLineTerm(line, from) {
-  for (let i = from; i < line.length; i++) {
-    const t = line.charCodeAt(i);
-    if (t === 13 || t === 0x2028 || t === 0x2029) return true;
-  }
-  return false;
-}
-
-function endsParagraph(line) {
-  return isBlank(line) || fenceOpen(line) !== null || headingOf(line) !== null || isHr(line);
-}
 
 /** First index in [from, end) of `what` (1 or 2 chars) outside a backslash escape, or -1. */
 function findUnescaped(s, what2, ch, from, end) {
